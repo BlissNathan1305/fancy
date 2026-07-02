@@ -1,0 +1,28 @@
+[package]
+name = "App"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+crossterm = "0.27"
+evalexpr = "13.1.0"
+ratatui = { version = "0.26", features = ["crossterm"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[[bin]]
+name = "todo"
+path = "src/bin/todo.rs"
+
+[[bin]]
+name = "note"
+path = "src/bin/note.rs"
+
+[[bin]]
+name = "cal"
+path = "src/bin/cal.rs"
+
+[[bin]]
+name = "calc"
+path = "src/bin/calc.rs"
