@@ -29,6 +29,7 @@ struct App {
     list_state: ListState,
     mode: Mode,
     input_buffer: String,
+    scroll_offset: u16, 
 }
 
 impl App {
@@ -41,6 +42,7 @@ impl App {
             list_state: state,
             mode: Mode::SelectNote,
             input_buffer: String::new(),
+            scroll_offset: 0,
         };
         
         app.ensure_storage_dir();
@@ -49,7 +51,7 @@ impl App {
         if app.notes.is_empty() {
             app.notes.push(Note {
                 title: "Welcome.md".to_string(),
-                content: "Welcome to your Cyberpunk Notebook!\n\nPress 'n' to create a new note.\nPress 'e' to edit the current note.\nPress 'd' to delete a note.\nPress 'Esc' to stop editing.\nPress 'q' to safely quit.".to_string(),
+                content: "Welcome to your Cyberpunk Notebook!\n\nPress 'n' to create a new note.\nPress 'e' to edit the current note.\nPress 'x' to delete a note.\nPress 'Esc' to stop editing.\nPress 'q' to safely quit.".to_string(),
             });
         }
         
@@ -127,6 +129,7 @@ impl App {
             None => 0,
         };
         self.list_state.select(Some(i));
+        self.scroll_offset = 0; 
     }
 
     fn prev_note(&mut self) {
@@ -136,6 +139,7 @@ impl App {
             None => 0,
         };
         self.list_state.select(Some(i));
+        self.scroll_offset = 0; 
     }
 }
 
@@ -171,8 +175,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             match app.mode {
                 Mode::SelectNote => match key.code {
                     KeyCode::Char('q') => return Ok(()),
+                    // FIX: Added KeyCode::Down and KeyCode::Up support here
                     KeyCode::Down | KeyCode::Char('j') => app.next_note(),
                     KeyCode::Up | KeyCode::Char('k') => app.prev_note(),
+                    
+                    KeyCode::Char('u') => { if app.scroll_offset > 0 { app.scroll_offset -= 1; } }
+                    KeyCode::Char('d') => { app.scroll_offset += 1; }
                     KeyCode::Char('e') => {
                         if let Some(note) = app.current_note_mut() {
                             app.input_buffer = note.content.clone();
@@ -183,7 +191,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         app.input_buffer.clear();
                         app.mode = Mode::CreateNew;
                     }
-                    KeyCode::Char('d') => app.delete_current_note(),
+                    KeyCode::Char('x') => app.delete_current_note(), 
                     _ => {}
                 },
                 Mode::EditContent => match key.code {
@@ -246,7 +254,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ].as_ref())
         .split(f.size());
 
-    // 1. Header Block (Electric Pink)
     let header = Paragraph::new("🧬 CYBERNETIC NEON NOTEBOOK 🧬")
         .style(Style::default().fg(Color::Rgb(255, 0, 255)).add_modifier(Modifier::BOLD))
         .alignment(ratatui::layout::Alignment::Center)
@@ -261,7 +268,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ].as_ref())
         .split(main_layout[1]);
 
-    // 2. Left Column: Navigation Index
     let notes_list: Vec<ListItem> = app.notes.iter().map(|n| {
         ListItem::new(format!(" 📝 {}", n.title)).style(Style::default().fg(Color::Rgb(255, 255, 0)))
     }).collect();
@@ -281,13 +287,13 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .highlight_symbol("👁 ");
     f.render_stateful_widget(list_widget, workspace_chunks[0], &mut app.list_state);
 
-    // 3. Right Column: Display / Editing Pad
     let current_selected_index = app.list_state.selected().unwrap_or(0);
+    let pane_area = workspace_chunks[1];
     
     let (body_text, pane_title, border_color, text_color) = match app.mode {
         Mode::SelectNote => {
             let content = app.notes.get(current_selected_index).map(|n| n.content.as_str()).unwrap_or("");
-            (content.to_string(), " Read Pane ", Color::Rgb(0, 191, 255), Color::Rgb(200, 255, 200))
+            (content.to_string(), " Read Pane (u/d to Scroll) ", Color::Rgb(0, 191, 255), Color::Rgb(200, 255, 200))
         },
         Mode::EditContent => {
             (app.input_buffer.clone(), " EDITING MODE (Press ESC to save) ", Color::Rgb(255, 69, 0), Color::Rgb(0, 255, 255))
@@ -297,21 +303,40 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
     };
 
+    if app.mode == Mode::EditContent || app.mode == Mode::CreateNew {
+        let lines: Vec<&str> = body_text.split('\n').collect();
+        let current_line_idx = lines.len().saturating_sub(1);
+        let current_line = lines.last().unwrap_or(&"");
+        
+        let cursor_x = pane_area.x + 2 + (current_line.len() as u16 % (pane_area.width - 4));
+        let base_cursor_y = pane_area.y + 1 + (current_line_idx as u16) + (current_line.len() as u16 / (pane_area.width - 4));
+        
+        if base_cursor_y >= pane_area.y + pane_area.height - 2 {
+            app.scroll_offset = base_cursor_y - (pane_area.y + pane_area.height - 3);
+        }
+        
+        let cursor_y = base_cursor_y.saturating_sub(app.scroll_offset);
+        if cursor_y > pane_area.y && cursor_y < pane_area.y + pane_area.height - 1 {
+            f.set_cursor(cursor_x, cursor_y);
+        }
+    }
+
     let content_pane = Paragraph::new(body_text)
         .style(Style::default().fg(text_color))
         .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset, 0)) 
         .block(Block::default()
             .borders(Borders::ALL)
             .title(pane_title)
             .title_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
             .border_style(Style::default().fg(border_color)));
-    f.render_widget(content_pane, workspace_chunks[1]);
+    f.render_widget(content_pane, pane_area);
 
-    // 4. Footer Guide
+    // Dynamic Footer menu string update to show both control setups
     let footer_text = match app.mode {
-        Mode::SelectNote => "j/k: Move Index | n: New Note | e: Edit Text | d: Delete Note | q: Quit",
+        Mode::SelectNote => "🔀 Arrows / j/k: Navigate | u/d: Scroll Note | n: New | e: Edit | x: Delete | q: Quit",
         Mode::EditContent => "Typing Allowed... Hit 'Enter' for new line | Press 'Esc' to Save & Close",
-        Mode::CreateNew => "Type file name (e.g. project_ideas) then press 'Enter' to confirm or 'Esc' to cancel",
+        Mode::CreateNew => "Type file name then press 'Enter' to confirm or 'Esc' to cancel",
     };
 
     let footer = Paragraph::new(footer_text)
