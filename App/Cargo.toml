@@ -1,28 +1,20 @@
 [package]
-name = "App"
+name = "tui-snippets"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-chrono = "0.4.45"
+ratatui = "0.26"
 crossterm = "0.27"
-evalexpr = "13.1.0"
-ratatui = { version = "0.26", features = ["crossterm"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+arboard = "3.3"
+anyhow = "1.0"
+rpassword = "7.5.4"
+aes-gcm = { version = "0.11.0", features = ["aes"] }
+sha2 = "0.11.0"
+getrandom = "0.4.3"
 
 [[bin]]
-name = "todo"
-path = "src/bin/todo.rs"
-
-[[bin]]
-name = "note"
-path = "src/bin/note.rs"
-
-[[bin]]
-name = "cal"
-path = "src/bin/cal.rs"
-
-[[bin]]
-name = "calc"
-path = "src/bin/calc.rs"
+name = "snip"
+path = "src/bin/snippet.rs"

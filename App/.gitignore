@@ -1,1 +1,6 @@
+# Ignore the encrypted vault file (both local and hidden home variations)
+vault.enc
+.vault.enc
+
+# Ignore all Rust compilation outputs, binaries, and dependencies
 /target/
