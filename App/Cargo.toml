@@ -14,6 +14,10 @@ rpassword = "7.5.4"
 aes-gcm = { version = "0.11.0", features = ["aes"] }
 sha2 = "0.11.0"
 getrandom = "0.4.3"
+pulldown-cmark = "0.10"
+tui-textarea = "0.4"
+chrono = "0.4.45"
+evalexpr = "13.1.0"
 
 [[bin]]
 name = "snip"
