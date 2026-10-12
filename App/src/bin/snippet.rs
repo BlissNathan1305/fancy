@@ -1,298 +1,578 @@
-use anyhow::Result;
-use arboard::Clipboard;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::execute;
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tui_snippets::{copy_to_clipboard, data_dir, home_dir, term, write_atomic};
 
-const SNIPPETS_FILE: &str = "snippets.json";
+#[derive(Parser)]
+#[command(
+    name = "snip",
+    version,
+    about = "Code snippet manager for the terminal"
+)]
+struct Cli {
+    /// Merge snippets from another snippets.json into your collection, then exit
+    #[arg(long, value_name = "FILE")]
+    import: Option<PathBuf>,
+}
 
-// --- Data Model ---
+// --- Data ---
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct Snippet {
     title: String,
     language: String,
     code: String,
 }
 
-// --- App State ---
+fn load(path: &Path) -> Result<Vec<Snippet>> {
+    match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Ok(Vec::new()),
+        Ok(text) => serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{} is not valid snippet JSON; fix or move it and try again",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
 
-enum AppMode {
+fn save(path: &Path, snippets: &[Snippet]) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(snippets)?)?;
+    Ok(())
+}
+
+/// Adds snippets that are not already present; returns how many were added.
+fn merge(into: &mut Vec<Snippet>, from: Vec<Snippet>) -> usize {
+    let before = into.len();
+    for s in from {
+        if !into.contains(&s) {
+            into.push(s);
+        }
+    }
+    into.len() - before
+}
+
+/// Older versions kept `snippets.json` in whatever directory snip was started from.
+fn migrate_legacy(path: &Path) -> Result<Option<String>> {
+    if path.exists() {
+        return Ok(None);
+    }
+    let mut snippets = Vec::new();
+    let mut sources = Vec::new();
+    for candidate in [
+        PathBuf::from("snippets.json"),
+        home_dir().join("snippets.json"),
+    ] {
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if sources.contains(&canonical) {
+            continue;
+        }
+        if let Ok(found) = load(&canonical) {
+            merge(&mut snippets, found);
+            sources.push(canonical);
+        }
+    }
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    save(path, &snippets)?;
+    let names: Vec<String> = sources.iter().map(|p| p.display().to_string()).collect();
+    Ok(Some(format!(
+        "Imported {} snippets from {}",
+        snippets.len(),
+        names.join(", ")
+    )))
+}
+
+// --- Editor integration ---
+
+fn editor_command() -> String {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+    for candidate in ["nano", "nvim", "vim", "vi"] {
+        if Command::new("sh")
+            .args(["-c", &format!("command -v {candidate}")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return candidate.to_string();
+        }
+    }
+    "vi".to_string()
+}
+
+fn extension_for(language: &str) -> &'static str {
+    match language.to_lowercase().as_str() {
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "ts",
+        "bash" | "shell" | "sh" => "sh",
+        "go" => "go",
+        "c" => "c",
+        "c++" | "cpp" => "cpp",
+        "java" => "java",
+        "sql" => "sql",
+        "html" => "html",
+        "css" => "css",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "markdown" | "md" => "md",
+        _ => "txt",
+    }
+}
+
+/// Opens `code` in the user's editor and returns the edited text.
+fn edit_in_editor(code: &str, language: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!(
+        "snip-{}.{}",
+        std::process::id(),
+        extension_for(language)
+    ));
+    fs::write(&path, code)?;
+    // Run through the shell so values like `code --wait` work.
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"$1\"", editor_command()))
+        .arg("snip")
+        .arg(&path)
+        .status()
+        .context("could not start the editor")?;
+    let edited = fs::read_to_string(&path);
+    let _ = fs::remove_file(&path);
+    if !status.success() {
+        bail!("editor exited with {status}");
+    }
+    Ok(edited?.trim_end_matches('\n').to_string())
+}
+
+// --- App state ---
+
+enum Mode {
     Normal,
     Search,
+    NewTitle,
+    NewLanguage,
+    ConfirmDelete,
 }
 
 struct App {
+    path: PathBuf,
     snippets: Vec<Snippet>,
-    filtered_indices: Vec<usize>,
+    filtered: Vec<usize>,
     state: ListState,
-    mode: AppMode,
-    search_input: String,
-    status_message: String,
+    mode: Mode,
+    search: String,
+    input: String,
+    draft_title: String,
+    status: String,
 }
 
 impl App {
-    // Now returns a Result because it interacts with the file system
-    fn new() -> Result<Self> {
+    fn new(path: PathBuf, status: Option<String>) -> Result<Self> {
+        let snippets = load(&path)?;
         let mut app = Self {
-            snippets: Vec::new(),
-            filtered_indices: Vec::new(),
+            path,
+            snippets,
+            filtered: Vec::new(),
             state: ListState::default(),
-            mode: AppMode::Normal,
-            search_input: String::new(),
-            status_message: "Press 'r' to reload snippets from file".to_string(),
+            mode: Mode::Normal,
+            search: String::new(),
+            input: String::new(),
+            draft_title: String::new(),
+            status: status.unwrap_or_default(),
         };
-        
-        app.reload_from_file()?;
+        if app.status.is_empty() {
+            app.status = if app.snippets.is_empty() {
+                "No snippets yet. Press 'a' to add one.".to_string()
+            } else {
+                format!("Loaded {} snippets", app.snippets.len())
+            };
+        }
+        app.update_filter();
         Ok(app)
     }
 
-    fn reload_from_file(&mut self) -> Result<()> {
-        let path = PathBuf::from(SNIPPETS_FILE);
-
-        if path.exists() {
-            // Load from file
-            let data = fs::read_to_string(&path)?;
-            self.snippets = serde_json::from_str(&data)?;
-            self.status_message = format!("Loaded {} snippets from file.", self.snippets.len());
-        } else {
-            // Create file with dummy data if it doesn't exist
-            self.snippets = vec![
-                Snippet {
-                    title: "Read File".to_string(),
-                    language: "Rust".to_string(),
-                    code: "use std::fs;\n\nlet contents = fs::read_to_string(\"file.txt\")\n    .expect(\"Should have been able to read the file\");".to_string(),
-                },
-                Snippet {
-                    title: "HTTP GET".to_string(),
-                    language: "Python".to_string(),
-                    code: "import requests\n\nresponse = requests.get('https://api.example.com/data')\nprint(response.json())".to_string(),
-                },
-            ];
-            let json = serde_json::to_string_pretty(&self.snippets)?;
-            fs::write(&path, json)?;
-            self.status_message = format!("Created {}. Add snippets here!", SNIPPETS_FILE);
+    fn persist(&mut self) {
+        if let Err(e) = save(&self.path, &self.snippets) {
+            self.status = format!("SAVE FAILED: {e}");
         }
-
-        self.update_filter();
-        Ok(())
     }
 
     fn update_filter(&mut self) {
-        if self.search_input.is_empty() {
-            self.filtered_indices = (0..self.snippets.len()).collect();
+        let query = self.search.to_lowercase();
+        self.filtered = self
+            .snippets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                query.is_empty()
+                    || s.title.to_lowercase().contains(&query)
+                    || s.language.to_lowercase().contains(&query)
+                    || s.code.to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let keep = self.state.selected().filter(|&i| i < self.filtered.len());
+        self.state.select(keep.or(if self.filtered.is_empty() {
+            None
         } else {
-            let query = self.search_input.to_lowercase();
-            self.filtered_indices = self.snippets
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    s.title.to_lowercase().contains(&query) || s.language.to_lowercase().contains(&query)
-                })
-                .map(|(i, _)| i)
-                .collect();
-        }
-
-        if self.filtered_indices.is_empty() {
-            self.state.select(None);
-        } else {
-            self.state.select(Some(0));
-        }
+            Some(0)
+        }));
     }
 
-    fn get_selected_snippet(&self) -> Option<&Snippet> {
-        self.state.selected().and_then(|i| {
-            self.filtered_indices
-                .get(i)
-                .and_then(|&real_idx| self.snippets.get(real_idx))
-        })
+    fn selected_index(&self) -> Option<usize> {
+        self.state
+            .selected()
+            .and_then(|i| self.filtered.get(i).copied())
+    }
+
+    fn selected(&self) -> Option<&Snippet> {
+        self.selected_index().and_then(|i| self.snippets.get(i))
+    }
+
+    fn select_snippet(&mut self, real_index: usize) {
+        self.search.clear();
+        self.update_filter();
+        self.state
+            .select(self.filtered.iter().position(|&i| i == real_index));
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.filtered.len() as isize;
+        if len == 0 {
+            return;
+        }
+        let current = self.state.selected().unwrap_or(0) as isize;
+        self.state
+            .select(Some((current + delta).clamp(0, len - 1) as usize));
     }
 }
 
-// --- UI Rendering ---
+// --- UI ---
 
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Min(10),
-        Constraint::Length(10),
+        Constraint::Min(6),
+        Constraint::Percentage(45),
+        Constraint::Length(1),
     ])
     .split(f.size());
 
-    let top_block = match app.mode {
-        AppMode::Normal => Block::default().borders(Borders::ALL).title(" Snippet Manager "),
-        AppMode::Search => Block::default()
-            .borders(Borders::ALL)
-            .title(" Search (/ to cancel) ")
-            .border_style(Style::default().fg(Color::Yellow)),
+    let (top_title, top_text, top_color) = match app.mode {
+        Mode::Search => (
+            " Search title, language or code (Enter: keep | Esc: clear) ",
+            format!("{}▏", app.search),
+            Color::Yellow,
+        ),
+        Mode::NewTitle => (
+            " New snippet: title ",
+            format!("{}▏", app.input),
+            Color::Yellow,
+        ),
+        Mode::NewLanguage => (
+            " New snippet: language (e.g. Rust, Python) ",
+            format!("{}▏", app.input),
+            Color::Yellow,
+        ),
+        Mode::ConfirmDelete => (
+            " Confirm ",
+            "Delete this snippet? y: yes | any other key: no".to_string(),
+            Color::Red,
+        ),
+        Mode::Normal => (
+            " Snippet Manager ",
+            " j/k: Move | Enter: Copy | /: Search | a: Add | e: Edit code | d: Delete | q: Quit"
+                .to_string(),
+            Color::White,
+        ),
     };
-
-    let top_text = match app.mode {
-        AppMode::Normal => Line::from(" ↑/↓: Navigate | /: Search | Enter: Copy | r: Reload | q: Quit "),
-        AppMode::Search => Line::from(Span::styled(
-            format!(" {} ", app.search_input),
-            Style::default().fg(Color::Black).bg(Color::White),
-        )),
-    };
-    let top_paragraph = Paragraph::new(top_text).block(top_block);
-    f.render_widget(top_paragraph, chunks[0]);
+    let top = Paragraph::new(top_text)
+        .style(Style::default().fg(top_color))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(top_title)
+                .border_style(Style::default().fg(top_color)),
+        );
+    f.render_widget(top, chunks[0]);
 
     let items: Vec<ListItem> = app
-        .filtered_indices
+        .filtered
         .iter()
         .map(|&i| {
             let snip = &app.snippets[i];
-            let line = Line::from(vec![
-                Span::styled(format!(" {} ", snip.title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("({})", snip.language), Style::default().fg(Color::DarkGray)),
-            ]);
-            ListItem::new(line)
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", snip.title),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("({})", snip.language),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]))
         })
         .collect();
-
+    let title = if app.search.is_empty() {
+        format!(" Snippets ({}) ", app.snippets.len())
+    } else {
+        format!(
+            " Snippets ({} of {} match \"{}\") ",
+            app.filtered.len(),
+            app.snippets.len(),
+            app.search
+        )
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Snippets "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(Color::Cyan)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
     f.render_stateful_widget(list, chunks[1], &mut app.state.clone());
 
-    let preview_code = app
-        .get_selected_snippet()
+    let preview = app
+        .selected()
         .map(|s| s.code.clone())
         .unwrap_or_else(|| "No snippet selected.".to_string());
-
-    let preview = Paragraph::new(preview_code)
+    let preview = Paragraph::new(preview)
         .block(Block::default().borders(Borders::ALL).title(" Preview "))
         .style(Style::default().fg(Color::Cyan))
         .wrap(Wrap { trim: false });
     f.render_widget(preview, chunks[2]);
 
-    if !app.status_message.is_empty() {
-        let status = Paragraph::new(app.status_message.clone())
-            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
-        let bottom_rect = Rect {
-            x: 0,
-            y: f.size().height.saturating_sub(1),
-            width: f.size().width,
-            height: 1,
-        };
-        f.render_widget(status, bottom_rect);
-    }
+    f.render_widget(
+        Paragraph::new(format!(" {}", app.status)).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        chunks[3],
+    );
 }
 
-// --- Main Event Loop ---
-
-fn main() -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut app = App::new()?; // Notice the ?
-    let mut clipboard = Clipboard::new()?;
-
-    let result = run_app(&mut terminal, &mut app, &mut clipboard);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-    }
-
-    Ok(())
-}
-
-fn run_app(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    clipboard: &mut Clipboard,
-) -> Result<()> {
+fn run_app(terminal: &mut term::Tui, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            match app.mode {
-                AppMode::Normal => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('r') => {
-                        // RELOAD FROM FILE
-                        app.reload_from_file()?;
+        match app.mode {
+            Mode::Normal => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('r') => {
+                    app.snippets = load(&app.path)?;
+                    app.update_filter();
+                    app.status = format!("Reloaded {} snippets", app.snippets.len());
+                }
+                KeyCode::Char('/') => app.mode = Mode::Search,
+                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(snippet) = app.selected().cloned() {
+                        app.status = match copy_to_clipboard(&snippet.code) {
+                            Ok(()) => format!("Copied '{}' to clipboard", snippet.title),
+                            Err(e) => e,
+                        };
                     }
-                    KeyCode::Char('/') => {
-                        app.mode = AppMode::Search;
-                        app.search_input.clear();
-                        app.update_filter();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !app.filtered_indices.is_empty() {
-                            let current = app.state.selected().unwrap_or(0);
-                            let next = current.saturating_add(1).min(app.filtered_indices.len() - 1);
-                            app.state.select(Some(next));
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if let Some(current) = app.state.selected() {
-                            let next = current.saturating_sub(1);
-                            app.state.select(Some(next));
-                        } else if !app.filtered_indices.is_empty() {
-                            app.state.select(Some(0));
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(snippet) = app.get_selected_snippet() {
-                            match clipboard.set_text(&snippet.code) {
-                                Ok(_) => app.status_message = format!("Copied '{}' to clipboard!", snippet.title),
-                                Err(_) => app.status_message = "Failed to access clipboard.".to_string(),
+                }
+                KeyCode::Char('a') => {
+                    app.input.clear();
+                    app.mode = Mode::NewTitle;
+                }
+                KeyCode::Char('e') => {
+                    if let (Some(index), Some(snippet)) =
+                        (app.selected_index(), app.selected().cloned())
+                    {
+                        let edited = term::suspend(terminal, || {
+                            edit_in_editor(&snippet.code, &snippet.language)
+                        })?;
+                        match edited {
+                            Ok(code) if code != snippet.code => {
+                                app.snippets[index].code = code;
+                                app.persist();
+                                app.status = format!("Updated '{}'", snippet.title);
                             }
+                            Ok(_) => app.status = "No changes".to_string(),
+                            Err(e) => app.status = format!("Edit failed: {e}"),
                         }
                     }
-                    _ => {}
-                },
-                AppMode::Search => match key.code {
-                    KeyCode::Esc | KeyCode::Char('/') => {
-                        app.mode = AppMode::Normal;
-                        app.search_input.clear();
+                }
+                KeyCode::Char('d') if app.selected().is_some() => app.mode = Mode::ConfirmDelete,
+                _ => {}
+            },
+            Mode::Search => match key.code {
+                KeyCode::Esc => {
+                    app.search.clear();
+                    app.update_filter();
+                    app.mode = Mode::Normal;
+                }
+                KeyCode::Enter => app.mode = Mode::Normal,
+                KeyCode::Down => app.move_selection(1),
+                KeyCode::Up => app.move_selection(-1),
+                KeyCode::Backspace => {
+                    app.search.pop();
+                    app.update_filter();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.search.push(c);
+                    app.update_filter();
+                }
+                _ => {}
+            },
+            Mode::NewTitle | Mode::NewLanguage => match key.code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Normal;
+                    app.status = "Cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.clear()
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.push(c)
+                }
+                KeyCode::Enter if !app.input.trim().is_empty() => {
+                    let value = std::mem::take(&mut app.input).trim().to_string();
+                    if matches!(app.mode, Mode::NewTitle) {
+                        app.draft_title = value;
+                        app.mode = Mode::NewLanguage;
+                    } else {
+                        app.mode = Mode::Normal;
+                        let title = std::mem::take(&mut app.draft_title);
+                        let edited = term::suspend(terminal, || edit_in_editor("", &value))?;
+                        match edited {
+                            Ok(code) if !code.trim().is_empty() => {
+                                app.snippets.push(Snippet {
+                                    title: title.clone(),
+                                    language: value,
+                                    code,
+                                });
+                                app.persist();
+                                app.select_snippet(app.snippets.len() - 1);
+                                app.status = format!("Added '{title}'");
+                            }
+                            Ok(_) => app.status = "Empty snippet discarded".to_string(),
+                            Err(e) => app.status = format!("Edit failed: {e}"),
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Mode::ConfirmDelete => {
+                app.mode = Mode::Normal;
+                if key.code == KeyCode::Char('y') {
+                    if let Some(index) = app.selected_index() {
+                        let removed = app.snippets.remove(index);
+                        app.persist();
                         app.update_filter();
+                        app.status = format!("Deleted '{}'", removed.title);
                     }
-                    KeyCode::Enter => {
-                        app.mode = AppMode::Normal;
-                    }
-                    KeyCode::Backspace => {
-                        app.search_input.pop();
-                        app.update_filter();
-                    }
-                    KeyCode::Char(c) => {
-                        app.search_input.push(c);
-                        app.update_filter();
-                    }
-                    _ => {}
-                },
+                }
             }
         }
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let path = data_dir("snip")?.join("snippets.json");
+    let migrated = migrate_legacy(&path)?;
+
+    if let Some(from) = cli.import {
+        let mut snippets = load(&path)?;
+        let added = merge(&mut snippets, load(&from)?);
+        save(&path, &snippets)?;
+        println!("Imported {added} new snippet(s) into {}", path.display());
+        return Ok(());
+    }
+
+    let mut app = App::new(path, migrated)?;
+    let mut terminal = term::init()?;
+    let result = run_app(&mut terminal, &mut app);
+    term::restore()?;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snip(title: &str, code: &str) -> Snippet {
+        Snippet {
+            title: title.into(),
+            language: "Rust".into(),
+            code: code.into(),
+        }
+    }
+
+    #[test]
+    fn merge_skips_exact_duplicates() {
+        let mut a = vec![snip("one", "1")];
+        assert_eq!(merge(&mut a, vec![snip("one", "1"), snip("two", "2")]), 1);
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn search_matches_code_too() {
+        let dir = std::env::temp_dir().join(format!("snip-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snippets.json");
+        save(
+            &path,
+            &[
+                snip("Read File", "fs::read_to_string"),
+                snip("HTTP", "requests.get"),
+            ],
+        )
+        .unwrap();
+        let mut app = App::new(path, None).unwrap();
+        app.search = "requests".into();
+        app.update_filter();
+        assert_eq!(app.filtered, vec![1]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_file_is_reported() {
+        let path = std::env::temp_dir().join(format!("snip-bad-{}.json", std::process::id()));
+        fs::write(&path, "[{oops").unwrap();
+        assert!(load(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 }

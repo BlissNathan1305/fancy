@@ -1,141 +1,297 @@
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Gauge, Paragraph},
-    Terminal,
 };
 use std::{
-    io,
+    io::{self, Write},
     time::{Duration, Instant},
 };
+use tui_snippets::{notify, term};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Terminal Init
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+#[derive(Parser)]
+#[command(name = "timer", version, about = "Countdown timer for the terminal")]
+struct Cli {
+    /// Duration such as 90s, 25m, 1h30m or 10 (minutes)
+    #[arg(default_value = "5m", value_parser = parse_duration)]
+    duration: Duration,
 
-    // 2. State Setup (5 Minute Countdown)
-    let total_duration = Duration::from_secs(5 * 60);
-    let start_time = Instant::now();
-    let tick_rate = Duration::from_millis(200); // Slightly faster tick for snappier UI
-    let mut last_tick = Instant::now();
+    /// Label shown on screen and in the notification
+    #[arg(short, long, default_value = "Timer")]
+    label: String,
+}
 
-    loop {
-        let elapsed = start_time.elapsed();
-        let remaining = if elapsed >= total_duration {
-            Duration::ZERO
-        } else {
-            total_duration - elapsed
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return Err("empty duration".into());
+    }
+    let mut total = 0u64;
+    let mut number = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        let n: u64 = number
+            .parse()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        number.clear();
+        total += match c {
+            'h' => n * 3600,
+            'm' => n * 60,
+            's' => n,
+            _ => return Err(format!("unknown unit '{c}' in '{s}' (use h, m, s)")),
         };
+    }
+    if !number.is_empty() {
+        // A bare number means minutes.
+        total += number
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?
+            * 60;
+    }
+    if total == 0 {
+        return Err("duration must be greater than zero".into());
+    }
+    Ok(Duration::from_secs(total))
+}
 
-        // 3. UI Render Layer
-        terminal.draw(|f| {
-            // Main layout wrapper with an outer container box
-            let outer_block = Block::default()
-                .title(" ⏱️  RUST CLI TIMER ")
-                .title_alignment(Alignment::Center)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Indexed(242))); // Clean dark-gray border
+enum State {
+    Running { ends_at: Instant },
+    Paused { remaining: Duration },
+    Finished { at: Instant },
+}
 
-            let inner_area = outer_block.inner(f.size());
-            f.render_widget(outer_block, f.size());
+struct App {
+    label: String,
+    total: Duration,
+    state: State,
+}
 
-            // Split the internal area
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(30), // Top spacing
-                    Constraint::Length(3),      // Large Digital Clock
-                    Constraint::Length(2),      // Spacing
-                    Constraint::Length(2),      // Progress Bar Layout
-                    Constraint::Min(0),         // Spacer
-                    Constraint::Length(1),      // Instruction Bar
-                ])
-                .split(inner_area);
-
-            // Compute time remaining parameters
-            let secs = remaining.as_secs();
-            let minutes = secs / 60;
-            let seconds = secs % 60;
-            let percent = if total_duration.as_secs() > 0 {
-                (remaining.as_secs_f64() / total_duration.as_secs_f64()).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            // Dynamic Styling: Colors shift depending on time left
-            let theme_color = if percent > 0.5 {
-                Color::Cyan          // Plenty of time
-            } else if percent > 0.2 {
-                Color::Yellow        // Getting closer
-            } else {
-                Color::Red           // Running out!
-            };
-
-            // Render Digital Clock Display
-            let clock_str = format!(" {:02}:{:02} ", minutes, seconds);
-            let clock = Paragraph::new(clock_str)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(theme_color).add_modifier(Modifier::BOLD));
-            f.render_widget(clock, chunks[1]);
-
-            // Render High-Contrast Progress Bar
-            let gauge = Gauge::default()
-                .block(Block::default().borders(Borders::NONE))
-                .gauge_style(Style::default().fg(theme_color).bg(Color::Indexed(236)))
-                .ratio(percent)
-                .label(""); // Blank track creates a minimal sleek ribbon accent
-            f.render_widget(gauge, chunks[3]);
-
-            // Render Help/Instructions Footer Bar
-            let instructions = Line::from(vec![
-                Span::styled(" [Q/Esc] ", Style::default().fg(Color::Red).bold()),
-                Span::styled("Quit Timer ", Style::default().fg(Color::Gray)),
-                Span::styled(" │ ", Style::default().fg(Color::Indexed(240))),
-                Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Running...", Style::default().fg(Color::Green).italic()),
-            ]);
-            let help_paragraph = Paragraph::new(instructions).alignment(Alignment::Center);
-            f.render_widget(help_paragraph, chunks[5]);
-        })?;
-
-        // 4. Input handling & intervals
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    break;
-                }
-            }
-        }
-
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
-        }
-
-        if remaining == Duration::ZERO {
-            break;
+impl App {
+    fn new(label: String, total: Duration) -> Self {
+        Self {
+            label,
+            total,
+            state: State::Running {
+                ends_at: Instant::now() + total,
+            },
         }
     }
 
-    // 5. Cleanup Terminal State cleanly
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    fn remaining(&self) -> Duration {
+        match self.state {
+            State::Running { ends_at } => ends_at.saturating_duration_since(Instant::now()),
+            State::Paused { remaining } => remaining,
+            State::Finished { .. } => Duration::ZERO,
+        }
+    }
 
+    fn tick(&mut self) {
+        if matches!(self.state, State::Running { .. }) && self.remaining().is_zero() {
+            self.state = State::Finished { at: Instant::now() };
+            let _ = io::stdout().write_all(b"\x07");
+            let _ = io::stdout().flush();
+            if !cfg!(test) {
+                notify("⏱ Time's up", &self.label);
+            }
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        self.state = match self.state {
+            State::Running { .. } => State::Paused {
+                remaining: self.remaining(),
+            },
+            State::Paused { remaining } => State::Running {
+                ends_at: Instant::now() + remaining,
+            },
+            State::Finished { at } => State::Finished { at },
+        };
+    }
+
+    /// Add (or with a negative value remove) time; works while running, paused or finished.
+    fn adjust(&mut self, secs: i64) {
+        let delta = Duration::from_secs(secs.unsigned_abs());
+        let remaining = if secs >= 0 {
+            self.remaining() + delta
+        } else {
+            self.remaining().saturating_sub(delta)
+        };
+        let remaining = remaining.max(Duration::from_secs(1));
+        if secs > 0 {
+            self.total += Duration::from_secs(secs as u64);
+        }
+        self.total = self.total.max(remaining);
+        self.state = match self.state {
+            State::Paused { .. } => State::Paused { remaining },
+            _ => State::Running {
+                ends_at: Instant::now() + remaining,
+            },
+        };
+    }
+
+    fn restart(&mut self) {
+        self.state = State::Running {
+            ends_at: Instant::now() + self.total,
+        };
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let mut terminal = term::init()?;
+    let result = run(&mut terminal, App::new(cli.label, cli.duration));
+    term::restore()?;
+    result?;
     Ok(())
+}
+
+fn run(terminal: &mut term::Tui, mut app: App) -> io::Result<()> {
+    loop {
+        app.tick();
+        terminal.draw(|f| draw(f, &app))?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char(' ') | KeyCode::Char('p') => app.toggle_pause(),
+                    KeyCode::Char('+') | KeyCode::Char('=') => app.adjust(60),
+                    KeyCode::Char('-') => app.adjust(-60),
+                    KeyCode::Char('r') => app.restart(),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn draw(f: &mut ratatui::Frame, app: &App) {
+    let outer_block = Block::default()
+        .title(format!(" ⏱️  {} ", app.label))
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Indexed(242)));
+    let inner_area = outer_block.inner(f.size());
+    f.render_widget(outer_block, f.size());
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner_area);
+
+    let remaining = app.remaining();
+    // Round up so a 5m timer starts at 05:00 and shows 00:01 during its last second.
+    let secs = remaining.as_secs_f64().ceil() as u64;
+    let ratio = (remaining.as_secs_f64() / app.total.as_secs_f64()).clamp(0.0, 1.0);
+
+    let (theme_color, status, status_color) = match app.state {
+        State::Finished { at } => {
+            let flash = at.elapsed().as_millis() / 500 % 2 == 0;
+            (
+                if flash { Color::Red } else { Color::Yellow },
+                "TIME'S UP!",
+                Color::Red,
+            )
+        }
+        State::Paused { .. } => (Color::Yellow, "Paused", Color::Yellow),
+        State::Running { .. } if ratio > 0.5 => (Color::Cyan, "Running", Color::Green),
+        State::Running { .. } if ratio > 0.2 => (Color::Yellow, "Running", Color::Green),
+        State::Running { .. } => (Color::Red, "Running", Color::Green),
+    };
+
+    let clock = if secs >= 3600 {
+        format!(" {}:{:02}:{:02} ", secs / 3600, secs % 3600 / 60, secs % 60)
+    } else {
+        format!(" {:02}:{:02} ", secs / 60, secs % 60)
+    };
+    let clock = if matches!(app.state, State::Finished { .. }) {
+        " TIME'S UP ".to_string()
+    } else {
+        clock
+    };
+    f.render_widget(
+        Paragraph::new(clock).alignment(Alignment::Center).style(
+            Style::default()
+                .fg(theme_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        chunks[1],
+    );
+
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(theme_color).bg(Color::Indexed(236)))
+        .ratio(ratio)
+        .label("");
+    f.render_widget(gauge, chunks[3]);
+
+    let instructions = Line::from(vec![
+        Span::styled(" [Space] ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("Pause ", Style::default().fg(Color::Gray)),
+        Span::styled(" [+/-] ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("±1 min ", Style::default().fg(Color::Gray)),
+        Span::styled(" [R] ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("Restart ", Style::default().fg(Color::Gray)),
+        Span::styled(" [Q] ", Style::default().fg(Color::Red).bold()),
+        Span::styled("Quit ", Style::default().fg(Color::Gray)),
+        Span::styled(" │ ", Style::default().fg(Color::Indexed(240))),
+        Span::styled(status, Style::default().fg(status_color).italic()),
+    ]);
+    f.render_widget(
+        Paragraph::new(instructions).alignment(Alignment::Center),
+        chunks[5],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_durations() {
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("25m").unwrap(), Duration::from_secs(1500));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("10").unwrap(), Duration::from_secs(600));
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn pause_and_adjust() {
+        let mut app = App::new("t".into(), Duration::from_secs(120));
+        app.toggle_pause();
+        let before = app.remaining();
+        app.adjust(60);
+        assert!(matches!(app.state, State::Paused { .. }));
+        assert_eq!(app.remaining(), before + Duration::from_secs(60));
+        app.adjust(-600);
+        assert_eq!(app.remaining(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn finishes_at_zero() {
+        let mut app = App::new("t".into(), Duration::from_secs(60));
+        app.state = State::Running {
+            ends_at: Instant::now(),
+        };
+        app.tick();
+        assert!(matches!(app.state, State::Finished { .. }));
+    }
 }

@@ -1,11 +1,14 @@
 [package]
 name = "Hustle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+autobins = false
 
 [dependencies]
 ratatui = "0.26"
 crossterm = "0.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [[bin]]
 name = "call"

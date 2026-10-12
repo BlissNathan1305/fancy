@@ -12,13 +12,22 @@ pub fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 enum Message {
     NavigateTo(PathBuf),
+    Open(PathBuf),
     Back,
+    Up,
+    ToggleHidden,
 }
 
 struct FileManager {
     current_path: PathBuf,
     history: Vec<PathBuf>,
     files: Vec<FileItem>,
+    show_hidden: bool,
+    status: String,
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +48,8 @@ impl Sandbox for FileManager {
             current_path: starting_path,
             history: Vec::new(),
             files: Vec::new(),
+            show_hidden: false,
+            status: String::new(),
         };
         manager.update_files();
         manager
@@ -57,14 +68,34 @@ impl Sandbox for FileManager {
                     self.update_files();
                 }
             }
+            Message::Open(path) => {
+                // Hand the file to the desktop's default application.
+                self.status = match std::process::Command::new("xdg-open").arg(&path).spawn() {
+                    Ok(mut child) => {
+                        std::thread::spawn(move || child.wait());
+                        format!("Opened {}", path.display())
+                    }
+                    Err(e) => format!("Could not open {}: {}", path.display(), e),
+                };
+            }
             Message::Back => {
-                if let Some(parent) = self.history.pop() {
-                    self.current_path = parent;
+                if let Some(previous) = self.history.pop() {
+                    self.current_path = previous;
                     self.update_files();
-                } else if let Some(parent) = self.current_path.parent() {
+                } else {
+                    self.update(Message::Up);
+                }
+            }
+            Message::Up => {
+                if let Some(parent) = self.current_path.parent() {
+                    self.history.push(self.current_path.clone());
                     self.current_path = parent.to_path_buf();
                     self.update_files();
                 }
+            }
+            Message::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                self.update_files();
             }
         }
     }
@@ -74,9 +105,10 @@ impl Sandbox for FileManager {
         let sidebar = column![
             text("Favorites").size(18).style(iced::theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.6))),
             Space::with_height(10),
-            sidebar_button("🏠 Home", std::env::home_dir().unwrap_or_default()),
+            sidebar_button("🏠 Home", home_dir()),
+            sidebar_button("📄 Documents", home_dir().join("Documents")),
+            sidebar_button("📥 Downloads", home_dir().join("Downloads")),
             sidebar_button("💻 Root", PathBuf::from("/")),
-            sidebar_button("📥 Downloads", std::env::home_dir().unwrap_or_default().join("Downloads")),
         ]
         .padding(15)
         .spacing(8)
@@ -84,11 +116,17 @@ impl Sandbox for FileManager {
 
         // --- Top Navigation Bar ---
         let back_btn = button("⬅ Back").on_press(Message::Back).padding(8);
+        let up_btn = button("⬆ Up").on_press(Message::Up).padding(8);
+        let hidden_btn = button(if self.show_hidden { "Hide hidden" } else { "Show hidden" })
+            .on_press(Message::ToggleHidden)
+            .style(iced::theme::Button::Secondary)
+            .padding(8);
         let path_display = text(format!("{}", self.current_path.display()))
             .size(16)
             .style(iced::theme::Text::Default);
         
-        let top_bar = row![back_btn, Space::with_width(15), path_display]
+        let top_bar = row![back_btn, up_btn, Space::with_width(15), path_display, Space::with_width(Length::Fill), hidden_btn]
+            .spacing(6)
             .align_items(Alignment::Center)
             .padding(10);
 
@@ -119,15 +157,27 @@ impl Sandbox for FileManager {
             )
             .style(iced::theme::Button::Secondary)
             .padding(10)
-            .on_press(Message::NavigateTo(file.path.clone()))
+            .on_press(if file.is_dir {
+                Message::NavigateTo(file.path.clone())
+            } else {
+                Message::Open(file.path.clone())
+            })
             .width(Length::Fill);
 
             file_list = file_list.push(row_content);
         }
 
+        let status_bar = text(format!(
+            "{} items{}",
+            self.files.len(),
+            if self.status.is_empty() { String::new() } else { format!("  •  {}", self.status) }
+        ))
+        .size(13);
+
         let main_content = column![
             top_bar,
-            scrollable(file_list).height(Length::Fill)
+            scrollable(file_list).height(Length::Fill),
+            container(status_bar).padding([4, 10])
         ]
         .width(Length::Fill);
 
@@ -151,7 +201,15 @@ impl Sandbox for FileManager {
 impl FileManager {
     fn update_files(&mut self) {
         self.files.clear();
-        if let Ok(entries) = fs::read_dir(&self.current_path) {
+        self.status.clear();
+        let entries = match fs::read_dir(&self.current_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.status = format!("Cannot read folder: {}", e);
+                return;
+            }
+        };
+        {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -165,7 +223,7 @@ impl FileManager {
                 let datetime: DateTime<Local> = modified.into();
                 let modified_str = datetime.format("%Y-%m-%d %H:%M").to_string();
 
-                if !name.starts_with('.') {
+                if self.show_hidden || !name.starts_with('.') {
                     self.files.push(FileItem {
                         name,
                         path,

@@ -1,22 +1,20 @@
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    backend::{CrosstermBackend, Backend},
+    backend::Backend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
-use std::{error::Error, io, fs, path::PathBuf};
+use std::{error::Error, fs, io, path::PathBuf};
+use tui_snippets::{home_dir, term, write_atomic};
+use tui_textarea::TextArea;
 
-#[derive(PartialEq)]
-enum Mode {
-    SelectNote,
-    EditContent,
-    CreateNew,
+enum Mode<'a> {
+    Browse,
+    Edit(Box<TextArea<'a>>),
+    NewName(String),
+    ConfirmDelete,
 }
 
 struct Note {
@@ -24,146 +22,169 @@ struct Note {
     content: String,
 }
 
-struct App {
+struct App<'a> {
+    dir: PathBuf,
     notes: Vec<Note>,
     list_state: ListState,
-    mode: Mode,
-    input_buffer: String,
-    scroll_offset: u16, 
+    mode: Mode<'a>,
+    scroll_offset: u16,
+    status: String,
 }
 
-impl App {
-    fn new() -> App {
-        let mut state = ListState::default();
-        state.select(Some(0));
-        
+impl App<'_> {
+    fn new() -> io::Result<Self> {
+        let dir = home_dir().join(".rust_notes");
+        fs::create_dir_all(&dir)?;
         let mut app = App {
+            dir,
             notes: Vec::new(),
-            list_state: state,
-            mode: Mode::SelectNote,
-            input_buffer: String::new(),
+            list_state: ListState::default(),
+            mode: Mode::Browse,
             scroll_offset: 0,
+            status: "n: new note | e: edit | x: delete".to_string(),
         };
-        
-        app.ensure_storage_dir();
         app.load_all_notes();
-        
-        if app.notes.is_empty() {
-            app.notes.push(Note {
-                title: "Welcome.md".to_string(),
-                content: "Welcome to your Cyberpunk Notebook!\n\nPress 'n' to create a new note.\nPress 'e' to edit the current note.\nPress 'x' to delete a note.\nPress 'Esc' to stop editing.\nPress 'q' to safely quit.".to_string(),
-            });
-        }
-        
-        app
-    }
-
-    fn storage_dir(&self) -> PathBuf {
-        let mut path = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        path.push(".rust_notes");
-        path
-    }
-
-    fn ensure_storage_dir(&self) {
-        let dir = self.storage_dir();
-        if !dir.exists() {
-            let _ = fs::create_dir_all(dir);
-        }
+        Ok(app)
     }
 
     fn load_all_notes(&mut self) {
-        let dir = self.storage_dir();
         self.notes.clear();
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "md") {
-                    let title = path.file_name().unwrap().to_string_lossy().into_owned();
-                    if let Ok(content) = fs::read_to_string(path) {
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                    let title = entry.file_name().to_string_lossy().into_owned();
+                    if let Ok(content) = fs::read_to_string(&path) {
                         self.notes.push(Note { title, content });
                     }
                 }
             }
         }
-        self.notes.sort_by(|a, b| a.title.cmp(&b.title));
+        self.sort_notes();
+        self.list_state
+            .select(if self.notes.is_empty() { None } else { Some(0) });
     }
 
-    fn save_current_note(&self) {
-        if let Some(i) = self.list_state.selected() {
-            if i < self.notes.len() {
-                let mut path = self.storage_dir();
-                path.push(&self.notes[i].title);
-                let _ = fs::write(path, &self.notes[i].content);
+    fn sort_notes(&mut self) {
+        self.notes.sort_by_key(|n| n.title.to_lowercase());
+    }
+
+    fn selected(&self) -> Option<&Note> {
+        self.list_state.selected().and_then(|i| self.notes.get(i))
+    }
+
+    fn select_title(&mut self, title: &str) {
+        let idx = self.notes.iter().position(|n| n.title == title);
+        self.list_state.select(idx);
+        self.scroll_offset = 0;
+    }
+
+    fn save_selected(&mut self, content: String) {
+        let Some(i) = self.list_state.selected() else {
+            return;
+        };
+        let Some(note) = self.notes.get_mut(i) else {
+            return;
+        };
+        let path = self.dir.join(&note.title);
+        match write_atomic(&path, content.as_bytes()) {
+            Ok(()) => {
+                note.content = content;
+                self.status = format!("Saved {}", note.title);
             }
+            Err(e) => self.status = format!("Could not save {}: {e}", note.title),
         }
     }
 
-    fn delete_current_note(&mut self) {
-        if let Some(i) = self.list_state.selected() {
-            if !self.notes.is_empty() {
-                let mut path = self.storage_dir();
-                path.push(&self.notes[i].title);
-                let _ = fs::remove_file(path);
-                
-                self.notes.remove(i);
-                if self.notes.is_empty() {
-                    self.list_state.select(None);
-                } else if i >= self.notes.len() {
-                    self.list_state.select(Some(self.notes.len() - 1));
-                }
-            }
+    fn delete_selected(&mut self) {
+        let Some(i) = self.list_state.selected() else {
+            return;
+        };
+        if i >= self.notes.len() {
+            return;
+        }
+        let path = self.dir.join(&self.notes[i].title);
+        if let Err(e) = fs::remove_file(&path) {
+            self.status = format!("Could not delete: {e}");
+            return;
+        }
+        let removed = self.notes.remove(i);
+        self.status = format!("Deleted {}", removed.title);
+        if self.notes.is_empty() {
+            self.list_state.select(None);
+        } else if i >= self.notes.len() {
+            self.list_state.select(Some(self.notes.len() - 1));
         }
     }
 
-    fn current_note_mut(&mut self) -> Option<&mut Note> {
-        let i = self.list_state.selected()?;
-        self.notes.get_mut(i)
+    /// Creates the note (or reopens an existing one with that name) and starts editing it.
+    fn create_note(&mut self, raw_name: &str) {
+        let name = match sanitize_title(raw_name) {
+            Ok(name) => name,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        if !self.notes.iter().any(|n| n.title == name) {
+            if let Err(e) = write_atomic(&self.dir.join(&name), b"") {
+                self.status = format!("Could not create {name}: {e}");
+                return;
+            }
+            self.notes.push(Note {
+                title: name.clone(),
+                content: String::new(),
+            });
+            self.sort_notes();
+            self.status = format!("Created {name}");
+        } else {
+            self.status = format!("{name} already exists, opened it");
+        }
+        self.select_title(&name);
+        self.start_editing();
     }
 
-    fn next_note(&mut self) {
-        if self.notes.is_empty() { return; }
-        let i = match self.list_state.selected() {
-            Some(i) => if i >= self.notes.len() - 1 { 0 } else { i + 1 },
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-        self.scroll_offset = 0; 
+    fn start_editing(&mut self) {
+        if let Some(note) = self.selected() {
+            let mut textarea = TextArea::new(note.content.lines().map(String::from).collect());
+            textarea.set_cursor_line_style(Style::default());
+            self.mode = Mode::Edit(Box::new(textarea));
+        }
     }
 
-    fn prev_note(&mut self) {
-        if self.notes.is_empty() { return; }
-        let i = match self.list_state.selected() {
-            Some(i) => if i == 0 { self.notes.len() - 1 } else { i - 1 },
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-        self.scroll_offset = 0; 
+    fn move_selection(&mut self, delta: isize) {
+        if self.notes.is_empty() {
+            return;
+        }
+        let len = self.notes.len() as isize;
+        let current = self.list_state.selected().unwrap_or(0) as isize;
+        self.list_state
+            .select(Some((current + delta).rem_euclid(len) as usize));
+        self.scroll_offset = 0;
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut app = App::new();
-    let res = run_app(&mut terminal, &mut app);
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = res {
-        println!("{:?}", err);
+/// Note titles become file names, so keep them to a single plain path component.
+fn sanitize_title(raw: &str) -> Result<String, String> {
+    let mut name = raw.trim().to_string();
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
     }
+    if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return Err("Name cannot contain '/' or start with '.'".to_string());
+    }
+    if !name.ends_with(".md") {
+        name.push_str(".md");
+    }
+    Ok(name)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut app = App::new()?;
+    let mut terminal = term::init()?;
+    let res = run_app(&mut terminal, &mut app);
+    term::restore()?;
+    res?;
     Ok(())
 }
 
@@ -171,73 +192,74 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            match app.mode {
-                Mode::SelectNote => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    // FIX: Added KeyCode::Down and KeyCode::Up support here
-                    KeyCode::Down | KeyCode::Char('j') => app.next_note(),
-                    KeyCode::Up | KeyCode::Char('k') => app.prev_note(),
-                    
-                    KeyCode::Char('u') => { if app.scroll_offset > 0 { app.scroll_offset -= 1; } }
-                    KeyCode::Char('d') => { app.scroll_offset += 1; }
-                    KeyCode::Char('e') => {
-                        if let Some(note) = app.current_note_mut() {
-                            app.input_buffer = note.content.clone();
-                            app.mode = Mode::EditContent;
-                        }
-                    }
-                    KeyCode::Char('n') => {
-                        app.input_buffer.clear();
-                        app.mode = Mode::CreateNew;
-                    }
-                    KeyCode::Char('x') => app.delete_current_note(), 
-                    _ => {}
-                },
-                Mode::EditContent => match key.code {
-                    KeyCode::Esc => {
-                        let content_to_save = app.input_buffer.clone();
-                        if let Some(note) = app.current_note_mut() {
-                            note.content = content_to_save;
-                            app.save_current_note();
-                        }
-                        app.mode = Mode::SelectNote;
-                    }
-                    KeyCode::Enter => app.input_buffer.push('\n'),
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => app.input_buffer.push(c),
-                    _ => {}
-                },
-                Mode::CreateNew => match key.code {
-                    KeyCode::Esc => app.mode = Mode::SelectNote,
-                    KeyCode::Enter => {
-                        if !app.input_buffer.is_empty() {
-                            let mut filename = app.input_buffer.trim().to_string();
-                            if !filename.ends_with(".md") {
-                                filename.push_str(".md");
-                            }
-                            
-                            let target_title = filename.clone();
-                            
-                            let new_note = Note {
-                                title: filename,
-                                content: String::new(),
-                            };
-                            app.notes.push(new_note);
-                            app.notes.sort_by(|a, b| a.title.cmp(&b.title));
-                            
-                            let new_idx = app.notes.iter().position(|n| n.title == target_title).unwrap_or(0);
-                            app.list_state.select(Some(new_idx));
-                            app.save_current_note();
-                            
-                            app.input_buffer.clear();
-                            app.mode = Mode::EditContent;
-                        }
-                    }
-                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                    KeyCode::Char(c) => app.input_buffer.push(c),
-                    _ => {}
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match &mut app.mode {
+            Mode::Browse => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    app.scroll_offset = app.scroll_offset.saturating_sub(5)
                 }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    let lines = app
+                        .selected()
+                        .map(|n| n.content.lines().count())
+                        .unwrap_or(0) as u16;
+                    app.scroll_offset = (app.scroll_offset + 5).min(lines.saturating_sub(1));
+                }
+                KeyCode::Char('e') | KeyCode::Enter => app.start_editing(),
+                KeyCode::Char('n') => app.mode = Mode::NewName(String::new()),
+                KeyCode::Char('x') if app.selected().is_some() => app.mode = Mode::ConfirmDelete,
+                KeyCode::Char('r') => {
+                    app.load_all_notes();
+                    app.status = format!("Reloaded {} notes", app.notes.len());
+                }
+                _ => {}
+            },
+            Mode::Edit(textarea) => {
+                let ctrl_s =
+                    key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if key.code == KeyCode::Esc || ctrl_s {
+                    let content = textarea.lines().join("\n");
+                    if key.code == KeyCode::Esc {
+                        app.mode = Mode::Browse;
+                    }
+                    app.save_selected(content);
+                } else {
+                    textarea.input(key);
+                }
+            }
+            Mode::NewName(buffer) => match key.code {
+                KeyCode::Esc => app.mode = Mode::Browse,
+                KeyCode::Enter => {
+                    let name = buffer.clone();
+                    app.mode = Mode::Browse;
+                    app.create_note(&name);
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buffer.clear()
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buffer.push(c)
+                }
+                _ => {}
+            },
+            Mode::ConfirmDelete => {
+                if key.code == KeyCode::Char('y') {
+                    app.delete_selected();
+                } else {
+                    app.status = "Delete cancelled".to_string();
+                }
+                app.mode = Mode::Browse;
             }
         }
     }
@@ -248,100 +270,156 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3), 
-            Constraint::Min(1),    
-            Constraint::Length(3), 
-        ].as_ref())
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
         .split(f.size());
 
     let header = Paragraph::new("🧬 CYBERNETIC NEON NOTEBOOK 🧬")
-        .style(Style::default().fg(Color::Rgb(255, 0, 255)).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Rgb(255, 0, 255))
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(0, 255, 255))));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(0, 255, 255))),
+        );
     f.render_widget(header, main_layout[0]);
 
-    let workspace_chunks = Layout::default()
+    let workspace = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30), 
-            Constraint::Percentage(70), 
-        ].as_ref())
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(main_layout[1]);
 
-    let notes_list: Vec<ListItem> = app.notes.iter().map(|n| {
-        ListItem::new(format!(" 📝 {}", n.title)).style(Style::default().fg(Color::Rgb(255, 255, 0)))
-    }).collect();
-
-    let sidebar_border_color = match app.mode {
-        Mode::SelectNote => Color::Rgb(138, 43, 226), 
-        _ => Color::DarkGray,
-    };
-
+    let browsing = matches!(app.mode, Mode::Browse | Mode::ConfirmDelete);
+    let notes_list: Vec<ListItem> = app
+        .notes
+        .iter()
+        .map(|n| {
+            ListItem::new(format!(" 📝 {}", n.title))
+                .style(Style::default().fg(Color::Rgb(255, 255, 0)))
+        })
+        .collect();
     let list_widget = List::new(notes_list)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(" Document Index ")
-            .title_style(Style::default().fg(Color::Rgb(0, 255, 128)))
-            .border_style(Style::default().fg(sidebar_border_color)))
-        .highlight_style(Style::default().bg(Color::Rgb(255, 0, 128)).fg(Color::White).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Document Index ({}) ", app.notes.len()))
+                .title_style(Style::default().fg(Color::Rgb(0, 255, 128)))
+                .border_style(Style::default().fg(if browsing {
+                    Color::Rgb(138, 43, 226)
+                } else {
+                    Color::DarkGray
+                })),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(255, 0, 128))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("👁 ");
-    f.render_stateful_widget(list_widget, workspace_chunks[0], &mut app.list_state);
+    f.render_stateful_widget(list_widget, workspace[0], &mut app.list_state);
 
-    let current_selected_index = app.list_state.selected().unwrap_or(0);
-    let pane_area = workspace_chunks[1];
-    
-    let (body_text, pane_title, border_color, text_color) = match app.mode {
-        Mode::SelectNote => {
-            let content = app.notes.get(current_selected_index).map(|n| n.content.as_str()).unwrap_or("");
-            (content.to_string(), " Read Pane (u/d to Scroll) ", Color::Rgb(0, 191, 255), Color::Rgb(200, 255, 200))
-        },
-        Mode::EditContent => {
-            (app.input_buffer.clone(), " EDITING MODE (Press ESC to save) ", Color::Rgb(255, 69, 0), Color::Rgb(0, 255, 255))
-        },
-        Mode::CreateNew => {
-            (app.input_buffer.clone(), " Enter file name + press Enter ", Color::Rgb(255, 255, 0), Color::Rgb(255, 255, 255))
+    let pane = workspace[1];
+    match &mut app.mode {
+        Mode::Edit(textarea) => {
+            let title = app
+                .list_state
+                .selected()
+                .and_then(|i| app.notes.get(i))
+                .map(|n| format!(" EDITING {} (Esc: save & close | Ctrl+S: save) ", n.title))
+                .unwrap_or_default();
+            textarea.set_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Rgb(255, 69, 0))
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .border_style(Style::default().fg(Color::Rgb(255, 69, 0))),
+            );
+            textarea.set_style(Style::default().fg(Color::Rgb(0, 255, 255)));
+            f.render_widget(textarea.widget(), pane);
         }
-    };
-
-    if app.mode == Mode::EditContent || app.mode == Mode::CreateNew {
-        let lines: Vec<&str> = body_text.split('\n').collect();
-        let current_line_idx = lines.len().saturating_sub(1);
-        let current_line = lines.last().unwrap_or(&"");
-        
-        let cursor_x = pane_area.x + 2 + (current_line.len() as u16 % (pane_area.width - 4));
-        let base_cursor_y = pane_area.y + 1 + (current_line_idx as u16) + (current_line.len() as u16 / (pane_area.width - 4));
-        
-        if base_cursor_y >= pane_area.y + pane_area.height - 2 {
-            app.scroll_offset = base_cursor_y - (pane_area.y + pane_area.height - 3);
+        Mode::NewName(buffer) => {
+            let prompt = Paragraph::new(format!("{buffer}▏"))
+                .style(Style::default().fg(Color::White))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" New note name (Enter: create | Esc: cancel) ")
+                        .border_style(Style::default().fg(Color::Rgb(255, 255, 0))),
+                );
+            f.render_widget(prompt, pane);
         }
-        
-        let cursor_y = base_cursor_y.saturating_sub(app.scroll_offset);
-        if cursor_y > pane_area.y && cursor_y < pane_area.y + pane_area.height - 1 {
-            f.set_cursor(cursor_x, cursor_y);
+        Mode::Browse | Mode::ConfirmDelete => {
+            let body = match app.list_state.selected().and_then(|i| app.notes.get(i)) {
+                Some(note) if note.content.is_empty() => "(empty note — press e to edit)".to_string(),
+                Some(note) => note.content.clone(),
+                None => "No notes yet.\n\nPress 'n' to create your first note.\nNotes are saved as Markdown files in ~/.rust_notes".to_string(),
+            };
+            let content = Paragraph::new(body)
+                .style(Style::default().fg(Color::Rgb(200, 255, 200)))
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll_offset, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Read Pane (u/d to scroll) ")
+                        .title_style(
+                            Style::default()
+                                .fg(Color::Rgb(0, 191, 255))
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .border_style(Style::default().fg(Color::Rgb(0, 191, 255))),
+                );
+            f.render_widget(content, pane);
         }
     }
 
-    let content_pane = Paragraph::new(body_text)
-        .style(Style::default().fg(text_color))
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset, 0)) 
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(pane_title)
-            .title_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
-            .border_style(Style::default().fg(border_color)));
-    f.render_widget(content_pane, pane_area);
-
-    // Dynamic Footer menu string update to show both control setups
-    let footer_text = match app.mode {
-        Mode::SelectNote => "🔀 Arrows / j/k: Navigate | u/d: Scroll Note | n: New | e: Edit | x: Delete | q: Quit",
-        Mode::EditContent => "Typing Allowed... Hit 'Enter' for new line | Press 'Esc' to Save & Close",
-        Mode::CreateNew => "Type file name then press 'Enter' to confirm or 'Esc' to cancel",
+    let (footer_text, footer_color) = match &app.mode {
+        Mode::ConfirmDelete => (
+            format!(
+                "Delete '{}'? This removes the file. y: yes | any other key: cancel",
+                app.selected().map(|n| n.title.as_str()).unwrap_or("")
+            ),
+            Color::Rgb(255, 80, 80),
+        ),
+        Mode::Edit(_) => ("Arrows move | Ctrl+Z undo | Ctrl+S save | Esc save & close".to_string(), Color::Rgb(180, 180, 180)),
+        Mode::NewName(_) => ("Type a file name, then Enter".to_string(), Color::Rgb(180, 180, 180)),
+        Mode::Browse => (
+            format!("j/k: Move | u/d: Scroll | n: New | e: Edit | x: Delete | r: Reload | q: Quit   — {}", app.status),
+            Color::Rgb(180, 180, 180),
+        ),
     };
-
     let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::Rgb(180, 180, 180)))
+        .style(Style::default().fg(footer_color))
         .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     f.render_widget(footer, main_layout[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titles_are_sanitized() {
+        assert_eq!(sanitize_title(" Ideas ").unwrap(), "Ideas.md");
+        assert_eq!(sanitize_title("plan.md").unwrap(), "plan.md");
+        assert!(sanitize_title("../etc/passwd").is_err());
+        assert!(sanitize_title(".hidden").is_err());
+        assert!(sanitize_title("   ").is_err());
+    }
 }

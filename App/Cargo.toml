@@ -1,7 +1,8 @@
 [package]
 name = "tui-snippets"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+autobins = false
 
 [dependencies]
 ratatui = "0.26"
@@ -12,13 +13,51 @@ arboard = "3.3"
 anyhow = "1.0"
 rpassword = "7.5.4"
 aes-gcm = { version = "0.11.0", features = ["aes"] }
+argon2 = "0.5"
 sha2 = "0.11.0"
 getrandom = "0.4.3"
 pulldown-cmark = "0.10"
 tui-textarea = "0.4"
 chrono = "0.4.45"
 evalexpr = "13.1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "calc"
+path = "src/bin/calc.rs"
+
+[[bin]]
+name = "cal"
+path = "src/bin/cal.rs"
+
+[[bin]]
+name = "note"
+path = "src/bin/note.rs"
+
+[[bin]]
+name = "rtodo"
+path = "src/bin/todo.rs"
+
+[[bin]]
+name = "rustwarden"
+path = "src/bin/pass.rs"
+
+[[bin]]
+name = "pomodoro"
+path = "src/bin/pomodoro.rs"
 
 [[bin]]
 name = "snip"
 path = "src/bin/snippet.rs"
+
+[[bin]]
+name = "timer"
+path = "src/bin/timer.rs"
+
+[[bin]]
+name = "wordle"
+path = "src/bin/wordle.rs"
+
+[[bin]]
+name = "markdown-editor"
+path = "src/bin/markdown-editor.rs"
